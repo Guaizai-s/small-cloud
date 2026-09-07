@@ -7,6 +7,7 @@
     "dev:host": "vite --host",
     "proxy": "node proxy-server.js",
     "build": "vite build",
+    "test": "vitest run",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -18,7 +19,9 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",
+    "fake-indexeddb": "^6.2.2",
     "vite": "^5.0.0",
-    "vite-plugin-pwa": "^0.17.0"
+    "vite-plugin-pwa": "^0.17.0",
+    "vitest": "^2.1.9"
   }
 }
