@@ -10,12 +10,13 @@ const section = (title, content) => {
 
 const clipText = (text, max = 1000) => {
   const clean = String(text || '').trim();
+  if (max <= 0) return '';
   return clean.length > max ? `${clean.slice(0, max).trim()}...` : clean;
 };
 
-async function buildDiaryMemoryPrompt(role) {
+async function buildDiaryMemoryPrompt(role, options = {}) {
   const settings = role?.chatSettings || {};
-  if (!role?.id || settings.diaryMemoryEnabled !== true) return '';
+  if (options.enabled === false || !role?.id || settings.diaryMemoryEnabled !== true) return '';
 
   const limit = Math.min(20, Math.max(1, Number(settings.diaryMemoryLimit) || 3));
   const includeUser = settings.includeUserDiaries !== false;
@@ -49,19 +50,26 @@ export async function buildEnhancedSystemPrompt(role, contextMessages = [], opti
     parts.push(buildTimeContextPrompt(contextMessages));
   }
 
-  parts.push(String(role?.systemPrompt || '').trim());
+  parts.push(clipText(role?.systemPrompt, options.rolePromptMaxChars ?? 12000));
 
-  const worldBookEntries = await worldBookEntryService.getAll();
-  const worldBook = buildWorldBookContext(worldBookEntries, contextMessages, options.worldBook);
+  const worldBook = options.worldBookResult || buildWorldBookContext(
+    await worldBookEntryService.getAll(),
+    contextMessages,
+    options.worldBook
+  );
   if (worldBook.text) {
     console.log('📚 世界书命中:', worldBook.entries.map(entry => entry.title).join(', '));
     parts.push(`[World Book / 世界书]\n${worldBook.text}\n[/World Book]`);
   }
 
-  parts.push(section('核心设定', settings.coreMemory));
-  parts.push(section('长期记忆', settings.longTermMemory));
+  parts.push(section('核心设定', clipText(settings.coreMemory, options.coreMemoryMaxChars ?? 4000)));
+  parts.push(section('长期记忆', clipText(settings.longTermMemory, options.longTermMemoryMaxChars ?? 8000)));
 
-  const diaryMemory = await buildDiaryMemoryPrompt(role);
+  if (Array.isArray(options.memoryEntries) && options.memoryEntries.length) {
+    parts.push(section('相关记忆', options.memoryEntries.map(entry => `- ${entry.content}`).join('\n')));
+  }
+
+  const diaryMemory = await buildDiaryMemoryPrompt(role, { enabled: options.includeDiaries !== false });
   if (diaryMemory) parts.push(diaryMemory);
 
   if (settings.selectedPersonaId) {
@@ -100,7 +108,7 @@ export async function buildDiaryReviewSystemPrompt(role, contextMessages = [], d
   return parts.filter(Boolean).join('\n\n');
 }
 
-export async function buildHeartVoiceSystemPrompt(role, contextMessages = []) {
+export async function buildHeartVoiceSystemPrompt(role, contextMessages = [], options = {}) {
   const settings = role?.chatSettings || {};
   const worldBookEntries = await worldBookEntryService.getAll();
   const worldBook = buildWorldBookContext(worldBookEntries, contextMessages, {
@@ -114,6 +122,9 @@ export async function buildHeartVoiceSystemPrompt(role, contextMessages = []) {
     worldBook.text ? `[World Book / 世界书]\n${worldBook.text}\n[/World Book]` : '',
     section('核心设定', settings.coreMemory),
     section('长期记忆', settings.longTermMemory),
+    Array.isArray(options.memoryEntries) && options.memoryEntries.length
+      ? section('相关记忆', options.memoryEntries.map(entry => `- ${entry.content}`).join('\n'))
+      : '',
     [
       '你正在以角色本人的内在视角生成“心声”。',
       '心声不是对用户说出口的话，而是此刻内心的状态切片。请参考最近聊天上下文、世界书和角色设定，保持角色一致。',

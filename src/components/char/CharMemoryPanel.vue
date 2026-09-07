@@ -70,6 +70,12 @@
             </div>
 
             <small v-if="currentNote.hint" class="future-hint">{{ currentNote.hint }}</small>
+            <div v-if="currentNote.memory" class="structured-actions">
+              <button v-if="currentNote.memory.status === 'pending'" @click="acceptMemory(currentNote.memory, false)">接受</button>
+              <button v-if="currentNote.memory.status === 'pending'" @click="editMemory(currentNote.memory)">编辑</button>
+              <button v-if="currentNote.memory.status === 'pending' && currentNote.memory.conflictWithId" @click="acceptMemory(currentNote.memory, true)">替换旧记忆</button>
+              <button v-if="currentNote.memory.status !== 'archived'" @click="archiveMemory(currentNote.memory)">归档</button>
+            </div>
           </article>
 
           <article v-else key="empty-note" class="note-card empty-note">
@@ -93,8 +99,9 @@
 </template>
 
 <script setup>
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { clip, formatDate } from '../../composables/useCharProfile';
+import { memoryService } from '../../services/db';
 
 const props = defineProps({
   coreMemory: { type: String, default: '' },
@@ -119,6 +126,13 @@ const touchDeltaX = ref(0);
 const touchDeltaY = ref(0);
 const touchAxis = ref(null);
 const noteTransitionName = ref('note-next');
+const structuredMemories = ref([]);
+
+const loadStructuredMemories = async () => {
+  structuredMemories.value = props.role?.id ? await memoryService.listByRole(props.role.id) : [];
+};
+onMounted(loadStructuredMemories);
+watch(() => props.role?.id, loadStructuredMemories);
 
 const createNote = (patch) => ({
   audioMessage: null,
@@ -184,15 +198,32 @@ const memoryGroups = computed(() => {
     timestamp: Number(msg.favoriteAt || msg.timestamp) || 0
   }));
 
-  const all = [...heart, ...longTerm, ...core, ...diary, ...favorite]
+  const toStructuredNote = item => createNote({
+    id: `structured-${item.id}`,
+    kind: 'long-note',
+    title: { active: '自动记忆', pending: '待确认记忆', archived: '已归档记忆', superseded: '已替换记忆' }[item.status] || '结构化记忆',
+    dateLabel: formatDate(item.updatedAt),
+    content: item.content,
+    hint: `重要度 ${item.importance} · 置信度 ${Math.round((item.confidence || 0) * 100)}%`,
+    timestamp: Number(item.updatedAt) || 0,
+    memory: item
+  });
+  const automatic = structuredMemories.value.filter(item => item.status === 'active' && item.source !== 'heart_voice').map(toStructuredNote);
+  const pending = structuredMemories.value.filter(item => item.status === 'pending').map(toStructuredNote);
+  const archived = structuredMemories.value.filter(item => ['archived', 'superseded'].includes(item.status)).map(toStructuredNote);
+
+  const all = [...heart, ...automatic, ...pending, ...longTerm, ...core, ...diary, ...favorite]
     .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
 
-  return { all, heart, longTerm, core, diary, favorite };
+  return { all, heart, automatic, pending, archived, longTerm, core, diary, favorite };
 });
 
 const memoryTabs = computed(() => [
   { id: 'all', label: '全部', count: memoryGroups.value.all.length },
   { id: 'heart', label: '心声', count: memoryGroups.value.heart.length },
+  { id: 'automatic', label: '自动记忆', count: memoryGroups.value.automatic.length },
+  { id: 'pending', label: '待确认', count: memoryGroups.value.pending.length },
+  { id: 'archived', label: '已归档', count: memoryGroups.value.archived.length },
   { id: 'longTerm', label: '长期', count: memoryGroups.value.longTerm.length },
   { id: 'core', label: '核心', count: memoryGroups.value.core.length },
   { id: 'diary', label: '日记', count: memoryGroups.value.diary.length },
@@ -212,6 +243,15 @@ const currentNote = computed(() => activeNotes.value[currentIndex.value] || null
 const setActiveType = (type) => {
   activeType.value = type;
 };
+
+const acceptMemory = async (memory, replace) => { await memoryService.accept(memory.id, { replace }); await loadStructuredMemories(); };
+const editMemory = async memory => {
+  const content = prompt('编辑记忆内容', memory.content);
+  if (content === null || !content.trim()) return;
+  await memoryService.accept(memory.id, { content });
+  await loadStructuredMemories();
+};
+const archiveMemory = async memory => { await memoryService.archive(memory.id); await loadStructuredMemories(); };
 
 const setCurrentIndex = (index) => {
   const length = activeNotes.value.length;
@@ -294,6 +334,8 @@ const onTouchEnd = (event) => {
 </script>
 
 <style scoped>
+.structured-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+.structured-actions button { border:0; border-radius:999px; padding:7px 11px; background:rgba(0,0,0,.08); color:inherit; }
 .memory-panel {
   display: flex;
   flex-direction: column;

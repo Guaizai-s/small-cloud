@@ -1,6 +1,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   diaryService,
+  memoryService,
   messageService,
   roleService,
   worldBookEntryService
@@ -19,6 +20,7 @@ export function useCharDetailData(roleIdRef) {
   const worldEntries = ref([]);
   const roleMessages = ref([]);
   const roleDiaries = ref([]);
+  const structuredMemories = ref([]);
   const userAvatar = ref(defaultUserAvatar);
   const loading = ref(true);
   const currentMemoryAudioId = ref(null);
@@ -50,6 +52,7 @@ export function useCharDetailData(roleIdRef) {
     savedHeartVoices.value.length +
     favoriteMessages.value.length +
     roleDiaries.value.length +
+    structuredMemories.value.filter(item => item.status !== 'superseded' && item.source !== 'heart_voice').length +
     (coreMemory.value ? 1 : 0) +
     (longTermMemory.value ? 1 : 0)
   );
@@ -109,14 +112,17 @@ export function useCharDetailData(roleIdRef) {
     if (!currentRoleId.value) {
       roleMessages.value = [];
       roleDiaries.value = [];
+      structuredMemories.value = [];
       return;
     }
-    const [messages, diaries] = await Promise.all([
+    const [messages, diaries, memories] = await Promise.all([
       messageService.getByRoleTimeRange(currentRoleId.value, 0, Date.now() + 1000),
-      diaryService.getForRole(currentRoleId.value)
+      diaryService.getForRole(currentRoleId.value),
+      memoryService.listByRole(currentRoleId.value)
     ]);
     roleMessages.value = messages;
     roleDiaries.value = diaries;
+    structuredMemories.value = memories;
   };
 
   const loadAll = async () => {

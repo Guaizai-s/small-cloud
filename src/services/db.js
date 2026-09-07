@@ -122,6 +122,49 @@ db.version(10).stores({
   if (!role.profile) role.profile = {};
 }));
 
+// v11: 结构化记忆与可恢复的上下文任务
+export async function migrateHeartVoicesToMemories(tx) {
+  const roles = await tx.table('roles').toArray();
+  const memories = tx.table('memories');
+  const now = Date.now();
+  const rows = [];
+  for (const role of roles) {
+    const items = Array.isArray(role?.profile?.memoryItems) ? role.profile.memoryItems : [];
+    for (const item of items) {
+      if (item?.type !== 'heart_voice') continue;
+      rows.push({
+        id: `heart:${role.id}:${item.id}`,
+        scopeType: 'role', scopeId: String(role.id), ownerRoleId: role.id,
+        type: 'character_state',
+        content: String(item.content || item?.data?.currentThought || item?.data?.currentStatus || '').trim(),
+        keywords: [], importance: 2, confidence: 1, sourceMessageIds: [], sourceMissing: false,
+        status: 'active', supersedesId: null, source: 'heart_voice',
+        createdAt: Number(item.createdAt) || now, updatedAt: Number(item.createdAt) || now, lastAccessedAt: null
+      });
+    }
+  }
+  if (rows.length) await memories.bulkPut(rows);
+}
+
+db.version(11).stores({
+  roles: '++id, name, createdAt, updatedAt',
+  conversations: '++id, roleId, updatedAt, isTop, isMuted',
+  messages: '++id, conversationId, timestamp',
+  apiProfiles: '++id, name, createdAt',
+  userPersonas: '++id, name, createdAt',
+  stickers: '++id, name, libraryId, createdAt',
+  stickerLibraries: '++id, name, createdAt',
+  assets: 'key',
+  walletAccounts: '++id, &[ownerType+ownerId], ownerType, ownerId, updatedAt',
+  walletTransactions: '++id, conversationId, messageId, type, status, createdAt, updatedAt',
+  worldBookEntries: 'id, enabled, triggerType, priority, updatedAt',
+  diaries: '++id, authorType, roleId, dateKey, startAt, endAt, visibility, includeInContext, createdAt, updatedAt',
+  diaryRoleLinks: '++id, diaryId, roleId',
+  dailyMoods: 'dateKey, moodId, updatedAt',
+  memories: 'id, scopeType, scopeId, ownerRoleId, type, status, updatedAt, *keywords',
+  contextJobs: 'id, type, roleId, status, nextRetryAt, updatedAt'
+}).upgrade(migrateHeartVoicesToMemories);
+
 // 角色管理
 const USER_OWNER = { ownerType: 'user', ownerId: 'self' };
 const WALLET_TYPES = new Set(['redpacket', 'transfer']);
@@ -172,9 +215,11 @@ const messageLastText = (message) => {
 
 const messageContentForContext = async (message) => {
   let content = message.content || '';
+  let imageRef = null;
   if (WALLET_TYPES.has(message.type)) {
     content = await walletService.describeMessageForContext(message);
   } else if (message.type === 'image') {
+    imageRef = content;
     content = '[图片]';
   } else if (message.type === 'sticker') {
     content = '[表情]';
@@ -182,13 +227,14 @@ const messageContentForContext = async (message) => {
     content = `[语音:${content}]`;
   }
 
-  if (!message.replyTo) return { ...message, content };
+  if (!message.replyTo) return { ...message, content, imageRef };
   const reply = message.replyTo;
   const author = reply.role === 'user' ? '用户' : '角色';
   const quoted = String(reply.content || '').replace(/\s+/g, ' ').slice(0, 80);
   return {
     ...message,
-    content: `[回复 ${author}: ${quoted}]\n${content}`
+    content: `[回复 ${author}: ${quoted}]\n${content}`,
+    imageRef
   };
 };
 
@@ -288,6 +334,8 @@ export const roleService = {
       }
     }
     await db.diaryRoleLinks.where('roleId').equals(id).delete();
+    await memoryService.archiveByRole(id);
+    await contextJobService.cancelByRole(id);
     await db.roles.delete(id);
   }
 };
@@ -343,7 +391,10 @@ export const conversationService = {
 
   // 删除会话
   async delete(id) {
+    const removed = await db.messages.where('conversationId').equals(id).primaryKeys();
     await db.messages.where('conversationId').equals(id).delete();
+    await memoryService.markSourcesMissing(removed);
+    await contextJobService.cancelByConversationMessages(removed);
     await db.conversations.delete(id);
   },
 
@@ -367,6 +418,10 @@ export const conversationService = {
 
 // 消息管理
 export const messageService = {
+  async getById(id) {
+    return await db.messages.get(Number(id));
+  },
+
   // 创建消息
   async create(conversationId, role, content, type = 'text', audioUrl = null, extra = {}) {
     const message = {
@@ -421,6 +476,22 @@ export const messageService = {
     return await Promise.all(recent.map(messageContentForContext));
   },
 
+  // 读取角色跨渠道的有效消息。保留 conversationId/source，供完整轮次、任务游标和未来群聊使用。
+  async getContextMessagesByRole(roleId, { beforeTimestamp = Infinity, limit = Infinity } = {}) {
+    const conversations = await db.conversations.where('roleId').equals(Number(roleId)).toArray();
+    const sourceById = new Map(conversations.map(conv => [conv.id, conv.source === 'sms' ? 'sms' : 'wechat']));
+    const rows = [];
+    for (const conv of conversations) {
+      const chunk = await db.messages.where('conversationId').equals(conv.id).toArray();
+      rows.push(...chunk
+        .filter(msg => msg.timestamp < beforeTimestamp && contextMessageTypes.has(msg.type) && !systemMessageTypes.has(msg.type))
+        .map(msg => ({ ...msg, channel: sourceById.get(msg.conversationId) })));
+    }
+    rows.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0) || Number(a.id) - Number(b.id));
+    const selected = Number.isFinite(limit) ? rows.slice(-Math.max(0, limit)) : rows;
+    return await Promise.all(selected.map(messageContentForContext));
+  },
+
   async getByRoleTimeRange(roleId, startAt, endAt) {
     const convs = await db.conversations.where('roleId').equals(roleId).toArray();
     const ids = convs.map(conv => conv.id);
@@ -441,6 +512,7 @@ export const messageService = {
   async delete(id) {
     const message = await db.messages.get(id);
     await db.messages.delete(id);
+    if (message) await memoryService.markSourcesMissing([message.id]);
     if (message?.conversationId) await refreshConversationLastMessage(message.conversationId);
   },
 
@@ -450,6 +522,7 @@ export const messageService = {
     const messages = await db.messages.bulkGet(cleanIds);
     const conversationIds = [...new Set(messages.filter(Boolean).map(msg => msg.conversationId))];
     await db.messages.bulkDelete(cleanIds);
+    await memoryService.markSourcesMissing(cleanIds);
     for (const conversationId of conversationIds) {
       await refreshConversationLastMessage(conversationId);
     }
@@ -481,7 +554,10 @@ export const messageService = {
 
   // 清空会话消息
   async clearConversation(conversationId) {
+    const removed = await db.messages.where('conversationId').equals(conversationId).primaryKeys();
     await db.messages.where('conversationId').equals(conversationId).delete();
+    await memoryService.markSourcesMissing(removed);
+    await contextJobService.cancelByConversationMessages(removed);
     await conversationService.update(conversationId, {
       lastMessage: '',
       unread: 0
@@ -1027,6 +1103,181 @@ export const diaryService = {
     return diaries
       .filter(entry => entry.includeInContext && (entry.authorType === 'role' || entry.visibility === 'role_visible'))
       .slice(0, Math.max(0, Number(limit) || 0));
+  }
+};
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, Number(value) || 0));
+const memoryId = () => globalThis.crypto?.randomUUID?.() || `memory_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+const normalizeMemory = (input = {}) => {
+  const now = Date.now();
+  return {
+    id: input.id || memoryId(),
+    scopeType: input.scopeType === 'conversation' ? 'conversation' : 'role',
+    scopeId: String(input.scopeId ?? input.ownerRoleId ?? ''),
+    ownerRoleId: Number(input.ownerRoleId),
+    type: input.type || 'user_fact',
+    content: String(input.content || '').trim(),
+    keywords: [...new Set((Array.isArray(input.keywords) ? input.keywords : []).map(value => String(value).trim().toLowerCase()).filter(Boolean))].slice(0, 20),
+    importance: clamp(input.importance || 3, 1, 5),
+    confidence: clamp(input.confidence ?? 0.5, 0, 1),
+    sourceMessageIds: [...new Set((input.sourceMessageIds || []).map(Number).filter(Number.isFinite))],
+    sourceMissing: Boolean(input.sourceMissing),
+    status: ['active', 'pending', 'superseded', 'archived'].includes(input.status) ? input.status : 'pending',
+    supersedesId: input.supersedesId || null,
+    conflictWithId: input.conflictWithId || null,
+    source: input.source || 'auto',
+    createdAt: Number(input.createdAt) || now,
+    updatedAt: Number(input.updatedAt) || now,
+    lastAccessedAt: Number(input.lastAccessedAt) || null
+  };
+};
+
+const tokenizeMemoryText = (value) => {
+  const text = String(value || '').toLowerCase();
+  const latin = text.match(/[a-z0-9_]{2,}/g) || [];
+  const cjk = (text.match(/[\u3400-\u9fff]+/g) || []).flatMap(block => {
+    if (block.length < 2) return [block];
+    return Array.from({ length: block.length - 1 }, (_, index) => block.slice(index, index + 2));
+  });
+  return new Set([...latin, ...cjk]);
+};
+
+export const memoryService = {
+  normalize: normalizeMemory,
+
+  async create(input) {
+    const row = normalizeMemory(input);
+    if (!row.content || !Number.isFinite(row.ownerRoleId)) throw new Error('记忆内容或角色无效');
+    await db.memories.put(row);
+    return row;
+  },
+
+  async get(id) {
+    return await db.memories.get(id);
+  },
+
+  async listByRole(roleId, { status } = {}) {
+    let rows = await db.memories.where('ownerRoleId').equals(Number(roleId)).toArray();
+    if (status) rows = rows.filter(row => row.status === status);
+    return rows.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  },
+
+  async retrieveForRole(roleId, query, limit = 5) {
+    const rows = await this.listByRole(roleId, { status: 'active' });
+    const queryTokens = tokenizeMemoryText(query);
+    const now = Date.now();
+    const scored = rows.map(row => {
+      const rowTokens = tokenizeMemoryText(`${row.content} ${(row.keywords || []).join(' ')}`);
+      let matches = 0;
+      queryTokens.forEach(token => { if (rowTokens.has(token)) matches += 1; });
+      const keywordScore = queryTokens.size ? matches / Math.max(1, queryTokens.size) : 0;
+      const ageDays = Math.max(0, (now - (row.updatedAt || now)) / 86400000);
+      const recency = 1 / (1 + ageDays / 30);
+      return { row, score: keywordScore * 6 + (row.importance || 3) * 0.8 + (row.confidence || 0.5) * 1.5 + recency * 0.5 };
+    }).sort((a, b) => b.score - a.score).slice(0, Math.min(5, Math.max(0, limit)));
+    const selected = scored.map(item => item.row);
+    if (selected.length) {
+      await db.transaction('rw', db.memories, async () => {
+        await Promise.all(selected.map(row => db.memories.update(row.id, { lastAccessedAt: now })));
+      });
+    }
+    return selected;
+  },
+
+  async update(id, changes) {
+    await db.memories.update(id, { ...changes, updatedAt: Date.now() });
+    return await db.memories.get(id);
+  },
+
+  async accept(id, { content, replace = false } = {}) {
+    return await db.transaction('rw', db.memories, async () => {
+      const row = await db.memories.get(id);
+      if (!row) throw new Error('记忆不存在');
+      if (replace && row.conflictWithId) {
+        await db.memories.update(row.conflictWithId, { status: 'superseded', updatedAt: Date.now() });
+      }
+      await db.memories.update(id, {
+        content: String(content ?? row.content).trim(),
+        status: 'active',
+        supersedesId: replace ? row.conflictWithId || null : null,
+        updatedAt: Date.now()
+      });
+      return await db.memories.get(id);
+    });
+  },
+
+  async archive(id) {
+    return await this.update(id, { status: 'archived' });
+  },
+
+  async archiveByRole(roleId) {
+    await db.memories.where('ownerRoleId').equals(Number(roleId)).modify({ status: 'archived', updatedAt: Date.now() });
+  },
+
+  async markSourcesMissing(messageIds = []) {
+    const removed = new Set(messageIds.map(Number));
+    if (!removed.size || !db.memories) return;
+    await db.memories.toCollection().modify(row => {
+      const sources = Array.isArray(row.sourceMessageIds) ? row.sourceMessageIds : [];
+      if (!sources.some(id => removed.has(Number(id)))) return;
+      const remaining = sources.filter(id => !removed.has(Number(id)));
+      row.sourceMessageIds = remaining;
+      row.sourceMissing = true;
+      row.updatedAt = Date.now();
+      if (!remaining.length) row.status = 'pending';
+    });
+  }
+};
+
+export const contextJobService = {
+  async put(job) {
+    const now = Date.now();
+    const row = {
+      attempts: 0,
+      nextRetryAt: now,
+      errorCode: null,
+      createdAt: now,
+      updatedAt: now,
+      ...job
+    };
+    await db.contextJobs.put(row);
+    return row;
+  },
+
+  async get(id) {
+    return await db.contextJobs.get(id);
+  },
+
+  async listRunnable(now = Date.now()) {
+    return (await db.contextJobs.toArray())
+      .filter(job => ['pending', 'failed'].includes(job.status) && (job.attempts || 0) < 3 && (job.nextRetryAt || 0) <= now)
+      .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  },
+
+  async update(id, changes) {
+    await db.contextJobs.update(id, { ...changes, updatedAt: Date.now() });
+    return await db.contextJobs.get(id);
+  },
+
+  async listByRole(roleId) {
+    return await db.contextJobs.where('roleId').equals(Number(roleId)).reverse().sortBy('updatedAt');
+  },
+
+  async cancelByConversationMessages(messageIds = []) {
+    const removed = new Set(messageIds.map(Number));
+    if (!removed.size || !db.contextJobs) return;
+    await db.contextJobs.toCollection().modify(job => {
+      if ((job.sourceMessageIds || []).some(id => removed.has(Number(id))) && !['done', 'cancelled'].includes(job.status)) {
+        job.status = 'cancelled';
+        job.errorCode = 'SOURCE_REMOVED';
+        job.updatedAt = Date.now();
+      }
+    });
+  },
+
+  async cancelByRole(roleId) {
+    await db.contextJobs.where('roleId').equals(Number(roleId)).modify({ status: 'cancelled', errorCode: 'ROLE_REMOVED', updatedAt: Date.now() });
   }
 };
 

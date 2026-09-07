@@ -54,6 +54,10 @@
           </div>
           <input v-model.number="settings.contextLength" type="range" min="1" max="300" class="wx-slider" />
         </div>
+        <button class="panel list-item" @click="currentView = 'memory'">
+          <span class="item-label">记忆与上下文</span>
+          <span class="item-right"><span class="item-value">{{ settings.contextTokenBudget || 8000 }} tokens</span><i class="ph ph-caret-right"></i></span>
+        </button>
       </section>
 
       <section class="settings-section">
@@ -177,6 +181,22 @@
         <input v-model.number="settings.minimaxPitch" type="range" min="-12" max="12" step="1" class="wx-slider" />
       </div>
     </main>
+
+    <main v-show="currentView === 'memory'" class="page-content sub-page">
+      <div class="group-label">固定记忆</div>
+      <div class="panel form-panel memory-texts">
+        <label class="form-row memory-row">
+          <span>核心记忆（最多注入 4000 字符）</span>
+          <textarea v-model="settings.coreMemory" rows="5" placeholder="角色设定、关系核心事实"></textarea>
+        </label>
+        <label class="form-row memory-row">
+          <span>长期记忆（最多注入 8000 字符）</span>
+          <textarea v-model="settings.longTermMemory" rows="5" placeholder="用户手动维护的长期记忆"></textarea>
+        </label>
+      </div>
+      <div class="group-label">结构化记忆</div>
+      <MemorySettingsPanel v-if="role?.id" :role-id="role.id" :settings="settings" @update:settings="Object.assign(settings, $event)" />
+    </main>
   </div>
 </template>
 
@@ -185,6 +205,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { apiProfileService, conversationService, personaService, roleService, stickerLibraryService } from '../services/db';
 import { roleSummary } from '../composables/useCharProfile';
+import MemorySettingsPanel from '../components/MemorySettingsPanel.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -208,6 +229,10 @@ const defaultAvatar = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/s
 
 const settings = reactive({
   contextLength: 15,
+  contextTokenBudget: 8000,
+  autoMemoryEnabled: false,
+  coreMemory: '',
+  longTermMemory: '',
   chatBackground: '',
   isTop: false,
   isMuted: false,
@@ -226,7 +251,8 @@ const viewTitle = computed(() => {
     api: 'API 方案',
     persona: '用户人设',
     stickers: '表情包库',
-    minimax: '语音音色'
+    minimax: '语音音色',
+    memory: '记忆与上下文'
   };
   return titles[currentView.value] || '聊天设置';
 });
@@ -370,6 +396,10 @@ onMounted(async () => {
   background: var(--wx-bg);
   color: var(--wx-text-primary);
 }
+
+.memory-texts { margin-bottom: 18px; }
+.memory-row { display: grid !important; gap: 10px; }
+.memory-row textarea { width: 100%; box-sizing: border-box; border: 0; outline: 0; resize: vertical; padding: 10px; border-radius: 12px; background: rgba(127,127,127,.08); color: inherit; font: inherit; }
 
 .nav-bar {
   height: 48px;

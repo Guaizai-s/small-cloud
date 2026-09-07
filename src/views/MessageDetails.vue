@@ -315,6 +315,11 @@
             ></textarea>
           </div>
 
+          <div class="text-[12px] font-bold tracking-widest uppercase mb-2 ml-2 transition-colors" :class="t.textMuted">结构化记忆</div>
+          <div class="rounded-[1.5rem] p-4 shadow-sm border transition-colors duration-500 mb-6" :class="[t.cardBg, t.border]">
+            <MemorySettingsPanel v-if="role?.id" :role-id="role.id" :settings="settings" @update:settings="applyMemorySettings" />
+          </div>
+
           <button class="w-full py-4 rounded-[1.25rem] font-semibold text-[16px] shadow-sm transition-all active:scale-95"
                   :class="[t.switchBg, activeTheme === 'midnight' ? '!text-[#121212]' : 'text-white']"
                   @click="goBack">
@@ -333,6 +338,7 @@ import { ref, computed, watch, onMounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { useTheme } from '../composables/useTheme';
 import { roleService, conversationService, apiProfileService, personaService } from '../services/db';
+import MemorySettingsPanel from '../components/MemorySettingsPanel.vue';
 
 const router = useRouter();
 const route = useRoute();
@@ -387,6 +393,8 @@ const settings = ref({
   isMuted: false,
   isRealTimeOn: true,
   contextLength: 15,
+  contextTokenBudget: 8000,
+  autoMemoryEnabled: false,
   longTermMemory: '',
   coreMemory: '',
   minimaxVoiceId: '',
@@ -403,6 +411,8 @@ const settings = ref({
 
 let convId = null;
 let initialized = false;
+
+const applyMemorySettings = (next) => { settings.value = { ...settings.value, ...next }; };
 
 const saveSettings = async () => {
   if (!role.value?.id || !initialized) return;
@@ -440,6 +450,8 @@ onMounted(async () => {
       isMuted: cs.isMuted ?? false,
       isRealTimeOn: cs.isRealTimeOn ?? true,
       contextLength: cs.contextLength ?? 15,
+      contextTokenBudget: cs.contextTokenBudget ?? 8000,
+      autoMemoryEnabled: cs.autoMemoryEnabled ?? false,
       longTermMemory: cs.longTermMemory || '',
       coreMemory: cs.coreMemory || '',
       minimaxVoiceId: cs.minimaxVoiceId || '',

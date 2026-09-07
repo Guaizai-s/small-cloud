@@ -364,7 +364,7 @@ const useVercelProxy = ref(false);
 const wallpaperPreview = ref('');
 const customIcons = ref({});
 const dataMsg = ref('');
-const BACKUP_TABLES = ['roles', 'conversations', 'messages', 'apiProfiles', 'userPersonas', 'stickers', 'stickerLibraries', 'assets', 'walletAccounts', 'walletTransactions', 'worldBookEntries'];
+const backupTableNames = () => db.tables.map(table => table.name);
 const BACKUP_LOCAL_STORAGE_KEYS = ['globalMinimax', 'useStreamAPI', 'useVercelProxy', SYSTEM_THEME_KEY, SMS_THEME_KEY, 'userStatus'];
 
 const loadAll = async () => {
@@ -433,7 +433,7 @@ const resetIcons = async () => {
 const exportData = async () => {
   try {
     const tables = {};
-    for (const tableName of BACKUP_TABLES) {
+    for (const tableName of backupTableNames()) {
       tables[tableName] = await db.table(tableName).toArray();
     }
 
@@ -445,7 +445,7 @@ const exportData = async () => {
 
     const backup = {
       app: 'xiaoshouji',
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
       tables,
       localStorage: localStorageData
@@ -488,7 +488,7 @@ const normalizeBackupTables = (backup) => {
   if (backup?.tables && typeof backup.tables === 'object') return backup.tables;
 
   const legacyTables = {};
-  for (const tableName of BACKUP_TABLES) {
+  for (const tableName of backupTableNames()) {
     if (Array.isArray(backup?.[tableName])) legacyTables[tableName] = backup[tableName];
   }
   return legacyTables;
@@ -501,17 +501,18 @@ const importData = async (event) => {
   try {
     const backup = await readJsonFile(file);
     const tables = normalizeBackupTables(backup);
-    const hasTableData = BACKUP_TABLES.some(tableName => Array.isArray(tables[tableName]));
+    const tableNames = backupTableNames();
+    const hasTableData = tableNames.some(tableName => Array.isArray(tables[tableName]));
     if (!hasTableData) throw new Error('未找到可导入的数据表');
 
     const ok = confirm('导入备份会清空当前本地数据，并替换为备份文件中的内容。确定继续吗？');
     if (!ok) return;
 
-    await db.transaction('rw', BACKUP_TABLES.map(tableName => db.table(tableName)), async () => {
-      for (const tableName of BACKUP_TABLES) {
+    await db.transaction('rw', tableNames.map(tableName => db.table(tableName)), async () => {
+      for (const tableName of tableNames) {
         await db.table(tableName).clear();
       }
-      for (const tableName of BACKUP_TABLES) {
+      for (const tableName of tableNames) {
         const rows = tables[tableName];
         if (Array.isArray(rows) && rows.length > 0) {
           await db.table(tableName).bulkPut(rows);

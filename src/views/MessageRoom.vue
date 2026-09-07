@@ -195,14 +195,10 @@
 <script setup>
 import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { roleService, conversationService, messageService, apiProfileService } from '../services/db.js';
-import { callClaude } from '../services/claude.js';
-import { textToSpeech } from '../services/minimax.js'; // 引入语音服务
+import { roleService, conversationService, memoryService, messageService, apiProfileService } from '../services/db.js';
+import { chatOrchestrator } from '../services/chatOrchestrator.js';
 import { useTheme } from '../composables/useTheme.js';
 import HeartVoicePanel from '../components/HeartVoicePanel.vue';
-import { buildEnhancedSystemPrompt, buildHeartVoiceSystemPrompt } from '../utils/promptBuilder.js';
-import { parseMessageDirectives } from '../utils/directiveParser.js';
-import { buildHeartVoiceMessages, parseHeartVoiceResponse } from '../utils/heartVoice.js';
 import { createHeartVoiceMemory, normalizeProfile } from '../composables/useCharProfile.js';
 
 const route = useRoute();
@@ -411,14 +407,8 @@ const generateHeartVoice = async () => {
   heartVoiceError.value = '';
   heartVoiceSaved.value = false;
   try {
-    const contextLength = Math.max(20, role.value?.chatSettings?.contextLength || 15);
-    const contextMessages = await messageService.getCombinedContext(roleId, contextLength);
-    const systemPrompt = await buildHeartVoiceSystemPrompt(role.value, contextMessages);
-    const response = await callClaude(
-      { ...role.value, systemPrompt, skipSystemPromptMerge: true },
-      buildHeartVoiceMessages(contextMessages)
-    );
-    heartVoiceData.value = parseHeartVoiceResponse(response);
+    const result = await chatOrchestrator.heartVoice({ roleId });
+    heartVoiceData.value = result.data;
   } catch (error) {
     heartVoiceError.value = error.message || '心声生成失败';
   } finally {
@@ -436,14 +426,19 @@ const saveHeartVoice = async () => {
     const updatedRole = await roleService.update(role.value.id, {
       profile: { ...profile, memoryItems }
     });
+    const heartContent = memoryItems[0].content || memoryItems[0].title;
+    if (heartContent) await memoryService.create({
+      id: `heart:${role.value.id}:${memoryItems[0].id}`,
+      scopeType: 'role', scopeId: String(role.value.id), ownerRoleId: role.value.id,
+      type: 'character_state', content: heartContent, keywords: [], importance: 2,
+      confidence: 1, sourceMessageIds: [], status: 'active', source: 'heart_voice'
+    });
     role.value = { ...role.value, profile: updatedRole.profile };
     heartVoiceSaved.value = true;
   } finally {
     heartVoiceSaving.value = false;
   }
 };
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // 离开页面时停止播放
 onUnmounted(() => {
@@ -500,15 +495,6 @@ const scrollToBottom = () => {
 
 watch(messages, () => scrollToBottom(), { deep: true });
 
-const createAssistantTextMessages = async (text) => {
-  const parts = (text || '').split('\n').map(part => part.trim()).filter(Boolean);
-  for (let i = 0; i < parts.length; i++) {
-    if (i > 0) await sleep(500);
-    const aiMsg = await messageService.create(convId.value, 'assistant', parts[i], 'text', null);
-    messages.value.push(aiMsg);
-  }
-};
-
 const handleSend = async () => {
   const text = inputText.value.trim();
   if (!text || !convId.value || isTyping.value) return;
@@ -526,47 +512,13 @@ const generateReply = async () => {
   if (!convId.value || isTyping.value || messages.value.length === 0) return;
   isTyping.value = true;
   try {
-    const contextLength = role.value?.chatSettings?.contextLength || 15;
-    const contextMessages = await messageService.getCombinedContext(roleId, contextLength);
-
-    const combined = contextMessages.map(m => ({
-      role: m.role === 'user' ? 'user' : 'assistant',
-      content: m.content
-    }));
-
-    const enhancedRole = {
-      ...role.value,
-      systemPrompt: await buildEnhancedSystemPrompt(role.value, contextMessages, { directiveTypes: ['voice'] }),
-      skipSystemPromptMerge: true
-    };
-
-    const reply = await callClaude(enhancedRole, combined);
-    const parsedReply = parseMessageDirectives(reply);
-    const voiceDirective = parsedReply.directives.find(directive => directive.type === 'voice');
-    let audioUrl = null;
-
-    if (voiceDirective) {
-      try {
-        const voiceSettings = role.value?.chatSettings || {};
-        // 请求语音接口生成 audioUrl
-        audioUrl = await textToSpeech(voiceDirective.text, {
-          voiceId: voiceSettings.minimaxVoiceId,
-          model: voiceSettings.minimaxModel,
-          speed: voiceSettings.minimaxSpeed,
-          pitch: voiceSettings.minimaxPitch
-        });
-      } catch (e) {
-        console.warn('语音生成失败:', e.message);
-      }
-      
-      // 创建一条带有 audioUrl 的消息
-      const aiMsg = await messageService.create(convId.value, 'assistant', voiceDirective.text || '语音消息', 'text', audioUrl);
-      messages.value.push(aiMsg);
-
-    }
-
-    await createAssistantTextMessages(parsedReply.cleanText);
-
+    await chatOrchestrator.reply({
+      roleId,
+      conversationId: convId.value,
+      channel: 'sms',
+      trigger: 'manual_generate',
+      callbacks: { onMessageCreated: message => messages.value.push(message) }
+    });
   } catch (e) {
     console.error('AI回复失败:', e);
     const errMsg = { id: Date.now(), role: 'assistant', content: `[回复失败: ${e.message}]`, timestamp: Date.now() };

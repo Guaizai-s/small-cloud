@@ -89,12 +89,8 @@ import NavBar from '../components/NavBar.vue';
 import MessageBubble from '../components/MessageBubble.vue';
 import ChatInput from '../components/ChatInput.vue';
 import HeartVoicePanel from '../components/HeartVoicePanel.vue';
-import { conversationService, diaryService, messageService, roleService, apiProfileService, stickerService, assetService, walletService, parseAmountToCents } from '../services/db';
-import { callClaude } from '../services/claude';
-import { textToSpeech } from '../services/minimax';
-import { parseMessageDirectives } from '../utils/directiveParser';
-import { buildEnhancedSystemPrompt, buildHeartVoiceSystemPrompt } from '../utils/promptBuilder';
-import { buildHeartVoiceMessages, parseHeartVoiceResponse } from '../utils/heartVoice';
+import { conversationService, memoryService, messageService, roleService, apiProfileService, stickerService, assetService, walletService, parseAmountToCents } from '../services/db';
+import { chatOrchestrator } from '../services/chatOrchestrator';
 import { createHeartVoiceMemory, normalizeProfile } from '../composables/useCharProfile';
 
 const route = useRoute();
@@ -399,14 +395,8 @@ const generateHeartVoice = async () => {
   heartVoiceError.value = '';
   heartVoiceSaved.value = false;
   try {
-    const contextLength = Math.max(20, role.value?.chatSettings?.contextLength || 15);
-    const contextMessages = await messageService.getCombinedContext(role.value.id, contextLength);
-    const systemPrompt = await buildHeartVoiceSystemPrompt(role.value, contextMessages);
-    const response = await callClaude(
-      { ...role.value, systemPrompt, skipSystemPromptMerge: true },
-      buildHeartVoiceMessages(contextMessages)
-    );
-    heartVoiceData.value = parseHeartVoiceResponse(response);
+    const result = await chatOrchestrator.heartVoice({ roleId: role.value.id });
+    heartVoiceData.value = result.data;
   } catch (error) {
     heartVoiceError.value = error.message || '心声生成失败';
   } finally {
@@ -423,6 +413,13 @@ const saveHeartVoice = async () => {
     const memoryItems = [createHeartVoiceMemory(heartVoiceData.value), ...profile.memoryItems].slice(0, 80);
     const updatedRole = await roleService.update(role.value.id, {
       profile: { ...profile, memoryItems }
+    });
+    const heartContent = memoryItems[0].content || memoryItems[0].title;
+    if (heartContent) await memoryService.create({
+      id: `heart:${role.value.id}:${memoryItems[0].id}`,
+      scopeType: 'role', scopeId: String(role.value.id), ownerRoleId: role.value.id,
+      type: 'character_state', content: heartContent, keywords: [], importance: 2,
+      confidence: 1, sourceMessageIds: [], status: 'active', source: 'heart_voice'
     });
     role.value = { ...role.value, profile: updatedRole.profile };
     heartVoiceSaved.value = true;
@@ -480,178 +477,22 @@ const refundTransferMessage = async (messageId) => {
   }
 };
 
-const createAssistantTextMessages = async (text) => {
-  const clean = (text || '').trim();
-  if (!clean) return;
-  const parts = clean.split('\n').filter(p => p.trim());
-  for (let i = 0; i < parts.length; i++) {
-    if (i > 0) await sleep(500);
-    await messageService.create(conversationId, 'assistant', parts[i], 'text', null);
-    await loadMessages();
-  }
-};
-
-const removeDirectiveRaws = (text, directives) => {
-  return directives.reduce((result, directive) => {
-    return directive.raw ? result.replace(directive.raw, '') : result;
-  }, text || '').trim();
-};
-
-const createAssistantWalletSequence = async (text, walletDirective, directivesToHide = []) => {
-  if (!walletDirective) {
-    await createAssistantTextMessages(removeDirectiveRaws(text, directivesToHide));
-    return;
-  }
-
-  const before = text.slice(0, walletDirective.index).trim();
-  const after = text.slice(walletDirective.index + walletDirective.raw.length).trim();
-
-  await createAssistantTextMessages(removeDirectiveRaws(before, directivesToHide));
-  await walletService.createIncoming({
-    conversationId,
-    roleId: role.value.id,
-    type: walletDirective.type,
-    amountCents: parseAmountToCents(walletDirective.amount),
-    note: walletDirective.note
-  });
-  await loadMessages();
-  await createAssistantTextMessages(removeDirectiveRaws(after, directivesToHide));
-};
-
 const generateReply = async () => {
   try {
     isTyping.value = true;
-    const startTime = Date.now();
     await refreshRoleSettings();
-
-    const contextLength = role.value?.chatSettings?.contextLength || 15;
-    const contextMessages = await messageService.getCombinedContext(role.value.id, contextLength);
-
-    // 找到上下文中最后一条图片消息的索引（该条发真实图像，其余用占位符）
-    let lastImageIndex = -1;
-    for (let i = contextMessages.length - 1; i >= 0; i--) {
-      if (contextMessages[i].type === 'image') { lastImageIndex = i; break; }
-    }
-    const apiFormat = role.value?.apiFormat || 'openai';
-
-    const apiMessages = await Promise.all(contextMessages.map(async (msg, index) => {
-      if (msg.type === 'image') {
-        if (index === lastImageIndex) {
-          const content = msg.content || '';
-          const match = content.match(/^\[IMAGE:(.+)\]$/);
-          const dataUrl = match
-            ? await assetService.get(match[1])
-            : content.startsWith('data:') ? content : null;
-          if (dataUrl) {
-            const mimeType = dataUrl.split(';')[0].split(':')[1] || 'image/jpeg';
-            const base64 = dataUrl.split(',')[1];
-            if (apiFormat === 'anthropic') {
-              return { role: msg.role, content: [{ type: 'image', source: { type: 'base64', media_type: mimeType, data: base64 } }] };
-            } else {
-              return { role: msg.role, content: [{ type: 'image_url', image_url: { url: dataUrl } }] };
-            }
-          }
-        }
-        return { role: msg.role, content: '[图片]' };
-      }
-      if (msg.audioUrl && msg.content) {
-        return { role: msg.role, content: `[语音:${msg.content}]` };
-      }
-      return { role: msg.role, content: msg.content };
-    }));
-
-    const settings = role.value?.chatSettings || {};
-    const enhancedPrompt = await buildEnhancedSystemPrompt(role.value, contextMessages);
-
-    const useStream = localStorage.getItem('useStreamAPI') === 'true';
-    let fullResponse = '';
-
-    const response = await callClaude(
-      { ...role.value, systemPrompt: enhancedPrompt, skipSystemPromptMerge: true },
-      apiMessages,
-      useStream ? async (chunk) => {
-        fullResponse += chunk;
-        const parsedChunk = parseMessageDirectives(chunk);
-        if (parsedChunk.cleanText) {
-          await messageService.create(conversationId, 'assistant', parsedChunk.cleanText, 'text', null);
-          await loadMessages();
-        }
-      } : null
-    );
-
-    const elapsed = Date.now() - startTime;
-    if (elapsed < 800) await sleep(800 - elapsed);
-
-    const rawText = useStream ? fullResponse : response;
-    const parsedResponse = parseMessageDirectives(rawText);
-    const voiceDirective = parsedResponse.directives.find(d => d.type === 'voice');
-    const walletDirectives = parsedResponse.directives.filter(d => d.type === 'redpacket' || d.type === 'transfer');
-    const walletDirective = walletDirectives.find(d => d.executable);
-    const diaryDirectives = parsedResponse.directives.filter(d => d.type === 'diary');
-    const diaryDirective = diaryDirectives.find(d => d.executable);
-    const hiddenDirectives = [...walletDirectives, ...diaryDirectives];
-
-    if (diaryDirective?.content) {
-      try {
-        const diary = await diaryService.create({
-          authorType: 'role',
-          roleId: role.value.id,
-          linkedRoleIds: [role.value.id],
-          dateKey: toDateKey(),
-          title: diaryDirective.title || `${formatMessageTime(Date.now())}的日记`,
-          content: diaryDirective.content,
-          visibility: 'role_visible',
-          includeInContext: true,
-          source: 'directive'
-        });
-        await messageService.create(
-          conversationId,
-          'system',
-          `${role.value?.name || '角色'}写了一篇日记 >`,
-          'diary_notice',
-          null,
-          { diaryId: diary.id }
-        );
-      } catch (error) {
-        console.warn('角色日记写入失败:', error.message);
-      }
-    }
-
-    if (voiceDirective) {
-      let audioUrl = null;
-      try {
-        audioUrl = await textToSpeech(voiceDirective.text, {
-          voiceId: settings.minimaxVoiceId,
-          model: settings.minimaxModel,
-          speed: settings.minimaxSpeed,
-          pitch: settings.minimaxPitch
-        });
-      } catch (error) {
-        console.warn('语音生成失败:', error.message);
-      }
-
-      if (!useStream) {
-        // 非流式：文字+语音都在全量响应里，按顺序建气泡
-        const textBefore = rawText.slice(0, voiceDirective.index).trim();
-        const textAfter = rawText.slice(voiceDirective.index + voiceDirective.raw.length).trim();
-        if (textBefore) await createAssistantTextMessages(removeDirectiveRaws(textBefore, hiddenDirectives));
-      }
-      if (voiceDirective.text || audioUrl) {
-        await messageService.create(conversationId, 'assistant', voiceDirective.text, 'text', audioUrl);
-        await loadMessages();
-      }
-      if (!useStream) {
-        const textAfter = rawText.slice(voiceDirective.index + voiceDirective.raw.length).trim();
-        if (textAfter) await createAssistantTextMessages(removeDirectiveRaws(textAfter, hiddenDirectives));
-      }
-    } else if (!useStream && (rawText || walletDirective)) {
-      await createAssistantWalletSequence(rawText, walletDirective, hiddenDirectives);
-    }
-
-    isTyping.value = false;
+    await chatOrchestrator.reply({
+      roleId: role.value.id,
+      conversationId,
+      channel: 'wechat',
+      trigger: 'manual_generate',
+      callbacks: { onMessageCreated: loadMessages }
+    });
+    await loadWalletBalance();
   } catch (error) {
-    isTyping.value = false;
     alert('生成失败: ' + error.message);
+  } finally {
+    isTyping.value = false;
   }
 };
 
@@ -668,23 +509,6 @@ const sendImageMessage = async (file, useOriginal) => {
   } catch (error) {
     alert('图片发送失败: ' + error.message);
   }
-};
-
-const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
-  const reader = new FileReader();
-  reader.onload = (e) => resolve(e.target.result);
-  reader.onerror = reject;
-  reader.readAsDataURL(file);
-});
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const toDateKey = (timestamp = Date.now()) => {
-  const date = new Date(timestamp);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
 };
 
 // 压缩图片：双边限制 + 统一输出 JPEG（PNG 的 quality 参数无效，转 JPEG 才能真正压缩）
