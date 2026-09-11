@@ -315,7 +315,6 @@
             ></textarea>
           </div>
 
-          <div class="text-[12px] font-bold tracking-widest uppercase mb-2 ml-2 transition-colors" :class="t.textMuted">结构化记忆</div>
           <div class="rounded-[1.5rem] p-4 shadow-sm border transition-colors duration-500 mb-6" :class="[t.cardBg, t.border]">
             <MemorySettingsPanel v-if="role?.id" :role-id="role.id" :settings="settings" @update:settings="applyMemorySettings" />
           </div>

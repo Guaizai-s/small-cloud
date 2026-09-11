@@ -56,7 +56,7 @@
         </div>
         <button class="panel list-item" @click="currentView = 'memory'">
           <span class="item-label">记忆与上下文</span>
-          <span class="item-right"><span class="item-value">{{ settings.contextTokenBudget || 8000 }} tokens</span><i class="ph ph-caret-right"></i></span>
+          <span class="item-right"><span class="item-value">{{ contextCapacityLabel }}</span><i class="ph ph-caret-right"></i></span>
         </button>
       </section>
 
@@ -186,16 +186,17 @@
       <div class="group-label">固定记忆</div>
       <div class="panel form-panel memory-texts">
         <label class="form-row memory-row">
-          <span>核心记忆（最多注入 4000 字符）</span>
-          <textarea v-model="settings.coreMemory" rows="5" placeholder="角色设定、关系核心事实"></textarea>
+          <span>核心记忆</span>
+          <textarea v-model="settings.coreMemory" rows="4" placeholder="角色设定、关系核心事实"></textarea>
         </label>
         <label class="form-row memory-row">
-          <span>长期记忆（最多注入 8000 字符）</span>
-          <textarea v-model="settings.longTermMemory" rows="5" placeholder="用户手动维护的长期记忆"></textarea>
+          <span>长期记忆</span>
+          <textarea v-model="settings.longTermMemory" rows="4" placeholder="用户手动维护的长期记忆"></textarea>
         </label>
       </div>
-      <div class="group-label">结构化记忆</div>
-      <MemorySettingsPanel v-if="role?.id" :role-id="role.id" :settings="settings" @update:settings="Object.assign(settings, $event)" />
+      <div class="memory-structured">
+        <MemorySettingsPanel v-if="role?.id" :role-id="role.id" :settings="settings" @update:settings="Object.assign(settings, $event)" />
+      </div>
     </main>
   </div>
 </template>
@@ -276,6 +277,13 @@ const linkedLibraryName = computed(() => {
   const library = libraries.value.find(item => sameId(item.id, settings.linkedLibraryId));
   return library?.name || '未选择';
 });
+
+const contextCapacityLabel = computed(() => ({
+  4000: '精简',
+  8000: '标准',
+  16000: '充足',
+  32000: '最大'
+}[Number(settings.contextTokenBudget) || 8000] || '自定义'));
 
 const normalizeId = (id) => {
   if (id === null || id === undefined || id === '') return null;
@@ -397,9 +405,10 @@ onMounted(async () => {
   color: var(--wx-text-primary);
 }
 
-.memory-texts { margin-bottom: 18px; }
-.memory-row { display: grid !important; gap: 10px; }
-.memory-row textarea { width: 100%; box-sizing: border-box; border: 0; outline: 0; resize: vertical; padding: 10px; border-radius: 12px; background: rgba(127,127,127,.08); color: inherit; font: inherit; }
+.memory-texts { margin-bottom: 16px; }
+.memory-row { display: grid !important; gap: 9px; padding:14px 16px !important; }
+.memory-row textarea { width:100%; min-height:104px; max-height:180px; box-sizing:border-box; border:0; outline:0; resize:vertical; padding:12px 13px; border-radius:13px; background:rgba(127,127,127,.08); color:inherit; font:inherit; font-size:15px; line-height:1.55; }
+.memory-structured { margin:0 16px; }
 
 .nav-bar {
   height: 48px;
